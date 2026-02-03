@@ -6,6 +6,11 @@ from typing import List, Optional
 import matplotlib.pyplot as plt
 import numpy as np
 
+"""
+NOTE:
+binary_map.reshape(-1)の1の部分に data_nc[selected_indices] = 1 else 0 を挿入して
+最終的に1であるindexを下の関数の引数`indices_n`に渡す。
+"""
 
 def save_refl_norm_map(
     refl_cube: np.ndarray,
@@ -151,10 +156,10 @@ def save_refl_norm_map(
     fig = plt.figure(figsize=figsize)
 
     if add_cbar:
-        main_ax = fig.add_axes([0, 0, 1 - cbar_fraction - cbar_pad, 1])
-        cax = fig.add_axes([1 - cbar_fraction, cbar_ypos, cbar_fraction, cbar_height])
+        main_ax = fig.add_axes([0, 0, 1 - cbar_fraction - cbar_pad, 1]) # type: ignore
+        cax = fig.add_axes([1 - cbar_fraction, cbar_ypos, cbar_fraction, cbar_height]) # type: ignore
     else:
-        main_ax = fig.add_axes([0, 0, 1, 1])
+        main_ax = fig.add_axes([0, 0, 1, 1]) # type: ignore
         cax = None
 
     im = main_ax.imshow(norm_map[:, ::-1], cmap=cmap, vmin=vmin, vmax=vmax)

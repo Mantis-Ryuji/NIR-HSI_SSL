@@ -232,9 +232,9 @@ def plot_silhouette_bar(
     ax.set_ylim(y0, y1)
 
     if major_yticks is not None:
-        ax.yaxis.set_major_locator(plt.MultipleLocator(major_yticks))
+        ax.yaxis.set_major_locator(plt.MultipleLocator(major_yticks)) # type: ignore
     if minor_yticks is not None:
-        ax.yaxis.set_minor_locator(plt.MultipleLocator(minor_yticks))
+        ax.yaxis.set_minor_locator(plt.MultipleLocator(minor_yticks)) # type: ignore
 
     if grid:
         ax.grid(True, which="major", axis="y", alpha=0.25)

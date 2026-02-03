@@ -91,7 +91,7 @@ def binarization(
     # -------------------------
     if margin_px > 0:
         dist_map = distance_transform_edt(binary_map)
-        binary_map = dist_map >= float(margin_px)
+        binary_map = dist_map >= float(margin_px) # type: ignore
 
     return {
         "norm_map": norm_map,

@@ -113,10 +113,10 @@ def save_tight_image(
     fig = plt.figure(figsize=figsize)
 
     if add_cbar:
-        main_ax = fig.add_axes([0, 0, 1 - cbar_fraction - cbar_pad, 1])
-        cax = fig.add_axes([1 - cbar_fraction, cbar_ypos, cbar_fraction, cbar_height])
+        main_ax = fig.add_axes([0, 0, 1 - cbar_fraction - cbar_pad, 1]) # type: ignore
+        cax = fig.add_axes([1 - cbar_fraction, cbar_ypos, cbar_fraction, cbar_height]) # type: ignore
     else:
-        main_ax = fig.add_axes([0, 0, 1, 1])
+        main_ax = fig.add_axes([0, 0, 1, 1]) # type: ignore
         cax = None
 
     # -------------------------
