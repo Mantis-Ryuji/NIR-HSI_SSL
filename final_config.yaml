@@ -79,5 +79,5 @@ evaluation:
   
 clustering:
   # "runs/final/clustering"下に weight, report を保存
-  k_max: 100
+  k_max: 50
   chunk: 5000000

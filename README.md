@@ -21,7 +21,7 @@ raw 256dim vs extrinsic_pca 32dim vs MAE 32dim
 
 ### クラスタリング
 raw 256dim vs extrinsic_pca 32dim vs MAE 32dim <br>
-
+k_opt は raw で決定して固定<br>
 以下追加検証
 - シルエットスコア
 - SCS
