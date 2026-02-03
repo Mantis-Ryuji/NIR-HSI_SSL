@@ -8,7 +8,7 @@ chemomae:
   dim_feedforward: 2048
   dropout: 0.1
   decoder_num_layers: 1
-  latent_dim: 16
+  latent_dim: 32
   n_patches: 16
 
 training:
@@ -52,7 +52,7 @@ evaluation:
     # runs/mask_rate_exploration/n_mask{int(n_mask)}/eval/each_task下に weight, result を保存
     width: 256
     depth: 2
-    dropout: float = 0.1
+    dropout: 0.0
     activation: "gelu"
     norm: "layernorm"
     residual: True

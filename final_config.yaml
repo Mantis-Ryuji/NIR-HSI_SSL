@@ -8,7 +8,7 @@ chemomae:
   dim_feedforward: 2048
   dropout: 0.1
   decoder_num_layers: 1
-  latent_dim: 16
+  latent_dim: 32
   n_patches: 16
   n_mask: ?????
 
@@ -51,7 +51,7 @@ training:
 evaluation:
   # "runs/final/pca下に weight を保存"
   extrinsic_pca:
-    n_components: 16
+    n_components: 32
     center: False
     renorm: True
     method: "svd"
