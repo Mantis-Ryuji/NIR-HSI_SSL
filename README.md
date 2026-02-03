@@ -9,6 +9,7 @@
 
 raw 256dim vs extrinsic_pca 16dim vs MAE 16dim
 
+- 温度ごとのt予測
 - 樹種識別
 - 色予測（L・a・b each）
 - 寸法変化率 （L・R・T each）

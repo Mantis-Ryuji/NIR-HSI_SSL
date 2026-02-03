@@ -1,6 +1,6 @@
 .venv/
 raw/
 data/
-
+*.pt
 __pycache__/
 checkpoints/
