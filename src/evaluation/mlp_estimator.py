@@ -146,7 +146,100 @@ class MLPNet(nn.Module):
 
 @dataclass
 class MLPConfig:
-    # task
+    """
+    `MLPEstimator` の設定（モデル構造・学習・計算設定）をまとめたデータクラス。
+
+    Parameters
+    ----------
+    task : {"classification", "regression"}, default="classification"
+        タスク種別。
+        - ``"classification"``: 分類（2値/多クラス）
+        - ``"regression"``: 回帰
+
+    in_dim : int, default=0
+        入力特徴次元 ``D``。`fit` 前に **必ず** 正の値を設定します。
+
+    num_classes : int or None, default=None
+        分類時のクラス数 ``K``。
+        ``task="classification"`` の場合に必須（``K>=2``）。
+        ``K==2`` のときは内部の出力次元は 1（BCEWithLogits）になります。
+
+    out_dim : int or None, default=None
+        回帰時の出力次元。``task="regression"`` の場合に使用します。
+        ``None`` のときは 1 とみなします。
+
+    width : int, default=256
+        MLP の中間幅（隠れ次元）。
+
+    depth : int, default=4
+        ブロック段数（`ResidualFFN` または単純 MLP ブロックを何個積むか）。
+
+    dropout : float, default=0.1
+        Dropout 率。
+
+    activation : {"relu", "gelu", "silu"}, default="gelu"
+        活性化関数。
+
+    norm : {"layernorm", "batchnorm", "none"}, default="layernorm"
+        正規化層の種類。
+
+    residual : bool, default=True
+        True の場合、残差付き FFN (`ResidualFFN`) を使用します。
+
+    epochs : int, default=50
+        学習エポック数。
+
+    lr : float, default=3e-4
+        学習率。
+
+    weight_decay : float, default=1e-4
+        weight decay（L2 正則化）。AdamW/Adam の引数として渡されます。
+
+    optimizer : {"adamw", "adam"}, default="adamw"
+        最適化手法。
+
+    grad_clip_norm : float or None, default=1.0
+        勾配ノルムクリップ。`None` で無効。
+
+    device : str or None, default=None
+        計算デバイス。`None` の場合は ``cuda -> mps -> cpu`` の順で自動選択。
+
+    amp : bool, default=True
+        Mixed Precision を有効にするかどうか。
+        実装では CUDA のときのみ有効化されます。
+
+    amp_dtype : {"bf16", "fp16"}, default="bf16"
+        AMP の dtype。fp16 の場合のみ GradScaler を使用します。
+
+    early_stopping : bool, default=True
+        Early stopping を使うかどうか（`val_loader` がある場合のみ有効）。
+
+    patience : int, default=10
+        改善が無いエポック数がこの回数続いたら打ち切り。
+
+    min_delta : float, default=0.0
+        改善判定の最小差分（``best_val - current_val > min_delta`` を改善とみなす）。
+
+    restore_best : bool, default=True
+        学習終了後に、検証損失が最良だった重みへ戻すかどうか。
+
+    seed : int or None, default=42
+        乱数シード。`None` の場合は設定しません。
+
+    verbose : int, default=1
+        ログ出力レベル。
+        - 0: 出力なし
+        - 1: epoch ごとの train/val loss を出力
+        - 2 以上: 追加で step ログも出力
+
+    log_every : int, default=50
+        ``verbose>=2`` かつ学習時に、何 step ごとに loss を表示するか。
+
+    Notes
+    -----
+    - 分類の損失は、2値なら BCEWithLogits、多クラスなら CrossEntropy。
+    - 回帰の損失は MSE。
+    """
     task: TaskType = "classification"
 
     # I/O
@@ -190,16 +283,71 @@ class MLPConfig:
 
 class MLPEstimator:
     """
-    DataLoader 入出力の MLP 推定器（classification / regression）。
+    DataLoader 入出力の簡易 MLP 推定器（分類/回帰）。
 
-    - train_loader は (x, y) を返すこと
-    - x は shape (B, D)
-    - classification:
-        - num_classes==2 のとき out_dim=1 (BCEWithLogits)
-        - num_classes>=3 のとき out_dim=num_classes (CrossEntropy)
-    - regression:
-        - out_dim = cfg.out_dim (Noneなら1)
-        - y は (B,) or (B, out_dim)
+    PyTorch の `DataLoader` を入力として、MLP の学習・推論・評価を行います。
+    scikit-learn の推定器 API（`fit` / `predict` / `evaluate` / `save` / `load`）に近い形で
+    最低限の実験を回せるようにしたユーティリティです。
+
+    Parameters
+    ----------
+    cfg : MLPConfig
+        モデル構造・学習設定。
+
+    Attributes
+    ----------
+    cfg : MLPConfig
+        設定。
+    device : torch.device
+        計算デバイス（auto 推論または `cfg.device` 指定）。
+    model : MLPNet
+        学習対象の MLP 本体。
+    opt : torch.optim.Optimizer
+        最適化器（AdamW/Adam）。
+    history : dict of list
+        学習履歴。少なくとも ``{"train_loss": [...], "val_loss": [...]}`` を保持します。
+        `val_loader` が無い場合、`val_loss` は空のままです。
+    best_state : dict or None
+        Early stopping における最良検証損失時の `state_dict`（`restore_best=True` なら復元に使用）。
+    best_val : float or None
+        最良の検証損失（`val_loader` がある場合のみ）。
+
+    Notes
+    -----
+    入力データ形式
+        `DataLoader` が返す `batch` は以下を想定します。
+
+        - ``(x, y)`` または ``{"x": x, "y": y}``
+        - 推論系（`predict` / `predict_proba`）では `y` が無くても可
+
+        ここで `x` は shape ``(B, D)`` を想定し、内部で ``float32`` に変換して device へ転送します。
+        回帰の `y` は内部で 2 次元 ``(B, out_dim)`` へ整形されます（``(B,)`` の場合は ``(B,1)``）。
+
+    分類タスクの扱い
+        - ``num_classes == 2`` の場合: 出力は 1 次元 logit（BCEWithLogits）
+        - ``num_classes >= 3`` の場合: 出力は ``K`` 次元 logit（CrossEntropy）
+
+        `predict` は class index（long）を返し、`predict_proba` は確率を ``(N, K)`` で返します
+        （2値でも ``K=2`` に整形）。
+
+    AMP（Mixed Precision）
+        `cfg.amp=True` でも、実装上は CUDA の場合のみ AMP を有効化します。
+        `amp_dtype="fp16"` のときのみ GradScaler を使用します。
+
+    Examples
+    --------
+    分類（多クラス）
+    >>> cfg = MLPConfig(task="classification", in_dim=128, num_classes=10)
+    >>> est = MLPEstimator(cfg).fit(train_loader, val_loader)
+    >>> y_pred = est.predict(test_loader)          # (N,)
+    >>> y_prob = est.predict_proba(test_loader)    # (N, 10)
+    >>> metrics = est.evaluate(test_loader)        # {"loss": ..., "acc": ...}
+
+    回帰
+    >>> cfg = MLPConfig(task="regression", in_dim=32, out_dim=1)
+    >>> est = MLPEstimator(cfg).fit(train_loader, val_loader)
+    >>> y_hat = est.predict(test_loader)           # (N,)
+    >>> metrics = est.evaluate(test_loader)        # {"loss": ..., "mse": ..., "mae": ..., "r2": ...}
     """
 
     def __init__(self, cfg: MLPConfig):
@@ -222,6 +370,26 @@ class MLPEstimator:
     # public methods
     # ----------------
     def fit(self, train_loader, val_loader=None) -> "MLPEstimator":
+        """
+        モデルを学習します（オプションで early stopping）。
+
+        Parameters
+        ----------
+        train_loader : iterable
+            学習用 DataLoader。各バッチは ``(x, y)`` または ``{"x": x, "y": y}`` を想定します。
+        val_loader : iterable or None, default=None
+            検証用 DataLoader。指定された場合、検証損失を監視して early stopping を行います。
+
+        Returns
+        -------
+        self : MLPEstimator
+            学習済みの推定器（チェーン可能）。
+
+        Notes
+        -----
+        - `cfg.early_stopping=True` かつ `val_loader` がある場合のみ early stopping が有効です。
+        - `cfg.restore_best=True` の場合、学習終了後に最良検証損失の重みへ復元します。
+        """
         cfg = self.cfg
         best_val = float("inf")
         best_state = None
@@ -270,8 +438,22 @@ class MLPEstimator:
     @torch.no_grad()
     def predict(self, loader) -> torch.Tensor:
         """
-        - classification: (N,) の class index (long)
-        - regression: (N, out_dim) or out_dim==1なら (N,)
+        推論を行い、ラベル（分類）または予測値（回帰）を返します。
+
+        Parameters
+        ----------
+        loader : iterable
+            推論用 DataLoader。各バッチは ``(x, y)`` / ``{"x": x, "y": y}`` / ``x`` を許容します。
+
+        Returns
+        -------
+        y_hat : torch.Tensor
+            - 分類: shape ``(N,)`` の class index（dtype long）
+            - 回帰: shape ``(N, out_dim)``、ただし ``out_dim==1`` のときは ``(N,)``
+
+        Notes
+        -----
+        分類の 2値判定は `sigmoid(logit) >= 0.5` により行います。
         """
         self.model.eval()
         preds: List[torch.Tensor] = []
@@ -298,7 +480,27 @@ class MLPEstimator:
     @torch.no_grad()
     def predict_proba(self, loader) -> torch.Tensor:
         """
-        classification のみ。返り値は (N, K) の確率（binaryでもK=2に整形）
+        分類の確率予測を返します（classification のみ）。
+
+        Parameters
+        ----------
+        loader : iterable
+            推論用 DataLoader。
+
+        Returns
+        -------
+        proba : torch.Tensor of shape (N, K)
+            クラス確率。2値分類でも ``K=2`` に整形して返します。
+
+        Raises
+        ------
+        RuntimeError
+            `task != "classification"` の場合。
+
+        Notes
+        -----
+        - 2値分類: ``[p0, p1]`` を返します（`p1 = sigmoid(logit)`）。
+        - 多クラス: `softmax` を返します。
         """
         if self.cfg.task != "classification":
             raise RuntimeError("predict_proba is only available for classification.")
@@ -324,8 +526,22 @@ class MLPEstimator:
     @torch.no_grad()
     def evaluate(self, loader) -> Dict[str, float]:
         """
-        - classification: {"loss", "acc"}
-        - regression: {"loss", "mse", "mae", "r2"}
+        損失と基本指標を計算します。
+
+        Parameters
+        ----------
+        loader : iterable
+            評価用 DataLoader。
+
+        Returns
+        -------
+        metrics : dict
+            - 分類: ``{"loss": float, "acc": float}``
+            - 回帰: ``{"loss": float, "mse": float, "mae": float, "r2": float}``
+
+        Notes
+        -----
+        回帰の指標は CPU 側へ集約して double で計算します（数値安定性のため）。
         """
         self.model.eval()
         total_loss = 0.0
@@ -386,6 +602,16 @@ class MLPEstimator:
         return out
 
     def save(self, path: str) -> None:
+        """
+        推定器を保存します（`torch.save`）。
+
+        保存内容は ``cfg``（dict 化）、`model.state_dict()`、`best_val`、`history` です。
+
+        Parameters
+        ----------
+        path : str
+            保存先パス。
+        """
         payload = {
             "cfg": asdict(self.cfg),
             "state_dict": self.model.state_dict(),
@@ -397,6 +623,21 @@ class MLPEstimator:
 
     @classmethod
     def load(cls, path: str, map_location: Optional[str] = None) -> "MLPEstimator":
+        """
+        保存済みファイルから推定器を復元します。
+
+        Parameters
+        ----------
+        path : str
+            読み込み元パス。
+        map_location : str or None, default=None
+            `torch.load` の `map_location`。指定しない場合は CPU に読み込みます。
+
+        Returns
+        -------
+        estimator : MLPEstimator
+            復元された推定器。
+        """
         loc = torch.device(map_location) if map_location is not None else torch.device("cpu")
         payload = torch.load(path, map_location=loc)
 

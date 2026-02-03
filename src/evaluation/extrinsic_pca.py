@@ -18,6 +18,41 @@ def _auto_device(device: Optional[str] = None) -> torch.device:
 
 @dataclass
 class ExtrinsicPCAConfig:
+    """
+    ExtrinsicPCA の設定（ハイパーパラメータ）をまとめたデータクラス。
+
+    Parameters
+    ----------
+    n_components : int, default=32
+        射影後の次元数 ``k``。
+    center : bool, default=False
+        平均中心化（``X <- X - mean``）を行うかどうか。
+        **下流が cosine 類似度（球面幾何）** を前提とする場合、中心化は幾何を崩しやすいので
+        ``False`` が無難です。
+    renorm : bool, default=True
+        射影後の ``Z`` を L2 正規化し、低次元の単位球面（``S^{k-1}``）へ戻すかどうか。
+        cosine 下流に渡すなら通常 ``True``。
+    method : {"lowrank", "svd"}, default="lowrank"
+        主成分方向の計算方法。
+        - ``"lowrank"``: `torch.pca_lowrank` による randomized SVD（GPU でスケールしやすい）
+        - ``"svd"``: `torch.linalg.svd` による厳密 SVD（高コストになり得る）
+    q : int or None, default=None
+        ``method="lowrank"`` の oversampling 次元。``None`` の場合は ``n_components + 8``。
+        大きいほど近似精度は上がりやすい一方、計算量・メモリが増えます。
+    niter : int, default=5
+        ``method="lowrank"`` の power iteration 回数。大きいほど精度は上がりやすい一方、遅くなります。
+    seed : int, default=42
+        ``method="lowrank"`` の乱数シード。
+    device : str or None, default=None
+        計算デバイス。``None`` の場合は ``cuda -> mps -> cpu`` の順で自動選択します。
+    dtype : {"float32", "float64"}, default="float32"
+        計算 dtype。数値安定性を優先するなら ``float64`` も選択可能（遅くなる場合あり）。
+
+    Notes
+    -----
+    - 本クラスは “外在的（extrinsic）” PCA であり、データが球面上にあっても
+      **埋め込み先のユークリッド空間（R^D）で PCA を行ってから線形射影**します。
+    """
     n_components: int = 32
     center: bool = False          # 球面/cosine下流なら False が無難
     renorm: bool = True           # 射影後に L2 正規化して低次元球面へ戻す
@@ -33,15 +68,62 @@ class ExtrinsicPCAConfig:
 
 class ExtrinsicPCA:
     """
-    Extrinsic PCA for spherical data: compute PCA in ambient Euclidean space (R^D).
+    球面データのための外在的 PCA（Extrinsic PCA）。
 
-    Fit on X (N,D), then transform by Z = X @ W where W=(D,k).
-    Optionally re-normalize Z onto unit sphere in R^k.
+    単位球面上のデータ ``X in R^{N×D}``（例：L2 正規化済み特徴）に対して、周辺ユークリッド空間 ``R^D`` で
+    主成分方向 ``W in R^{D×k}`` を推定し、線形射影
+    ``Z = X W`` により ``k`` 次元へ次元削減します。必要に応じて ``Z`` を L2 正規化し、
+    低次元球面（cosine 幾何）へ戻します。
 
-    Notes:
-      - center=False is often preferable when downstream uses cosine similarity.
-      - method="lowrank" uses torch.pca_lowrank (randomized SVD), scalable on GPU.
-      - method="svd" uses full SVD (exact but can be expensive).
+    Parameters
+    ----------
+    cfg : ExtrinsicPCAConfig
+        ハイパーパラメータ一式。
+
+    Attributes
+    ----------
+    cfg : ExtrinsicPCAConfig
+        設定。
+    device : torch.device
+        計算に使用するデバイス。
+    dtype : torch.dtype
+        計算に使用する dtype。
+    mean_ : torch.Tensor of shape (D,) or None
+        ``center=True`` のときの特徴平均。``center=False`` の場合は ``None``。
+    components_ : torch.Tensor of shape (D, k) or None
+        主成分方向（列ベクトルが各主成分）。``fit`` 後にセットされます。
+    singular_values_ : torch.Tensor of shape (k,) or None
+        上位 ``k`` 個の特異値。
+    explained_variance_ : torch.Tensor of shape (k,) or None
+        サンプル分散としての説明分散。実装上は ``S^2 / max(1, N-1)`` を格納します。
+
+    Notes
+    -----
+    - **中心化（center）**:
+      cosine 類似度を前提とする下流（球面クラスタリング等）では、中心化により方向情報が変わり得ます。
+      そのためデフォルトは ``center=False`` です。
+    - **正規化（renorm）**:
+      射影 ``Z = XW`` の後に ``Z`` を L2 正規化することで、低次元でも cosine 幾何を保ちやすくなります。
+    - **計算方法**:
+      ``method="lowrank"`` は `torch.pca_lowrank`（randomized SVD）を使い、大規模データでスケールしやすいです。
+      ``method="svd"`` は厳密ですが、``D`` や ``N`` が大きいと重くなります。
+    - 本クラスは scikit-learn の PCA と同様の API 形状（``fit/transform/inverse_transform``）を意識していますが、
+      **PyTorch Tensor 前提**であり、``torch.no_grad()`` 下で動作します。
+
+    Examples
+    --------
+    >>> import torch
+    >>> from extrinsic_pca import ExtrinsicPCA, ExtrinsicPCAConfig
+    >>> X = torch.randn(1000, 256)
+    >>> X = torch.nn.functional.normalize(X, dim=1)  # 球面データを仮定
+    >>> pca = ExtrinsicPCA(ExtrinsicPCAConfig(n_components=32, center=False, renorm=True))
+    >>> Z = pca.fit_transform(X)
+    >>> Z.shape
+    torch.Size([1000, 32])
+    >>> # 近似的に元空間へ戻す（ユークリッド再構成）
+    >>> Xhat = pca.inverse_transform(Z)
+    >>> Xhat.shape
+    torch.Size([1000, 256])
     """
 
     def __init__(self, cfg: ExtrinsicPCAConfig):
@@ -56,6 +138,33 @@ class ExtrinsicPCA:
 
     @torch.no_grad()
     def fit(self, X: torch.Tensor) -> "ExtrinsicPCA":
+        """
+        主成分方向（components_）を推定します。
+
+        Parameters
+        ----------
+        X : torch.Tensor of shape (N, D)
+            入力データ。``(N, D)`` の 2 次元テンソルである必要があります。
+            ``cfg.device`` / ``cfg.dtype`` に従って内部で転送・型変換されます。
+
+        Returns
+        -------
+        self : ExtrinsicPCA
+            学習済みインスタンス（``components_`` 等がセットされます）。
+
+        Raises
+        ------
+        TypeError
+            ``X`` が ``torch.Tensor`` でない場合。
+        ValueError
+            ``X`` が 2 次元でない場合、または ``n_components`` が不正な場合。
+
+        Notes
+        -----
+        - ``center=True`` の場合は平均との差分を取った ``Xc`` に対して分解します。
+        - ``method="lowrank"`` の場合のみ ``seed`` が乱数性に影響します（再現性のため）。
+        - ``explained_variance_`` は実装上 ``S^2 / max(1, N-1)`` を格納します。
+        """
         X = self._check_X(X)
 
         if self.cfg.center:
@@ -96,6 +205,24 @@ class ExtrinsicPCA:
 
     @torch.no_grad()
     def transform(self, X: torch.Tensor) -> torch.Tensor:
+        """
+        学習済み主成分方向へ射影して低次元表現を返します。
+
+        Parameters
+        ----------
+        X : torch.Tensor of shape (N, D)
+            入力データ。
+
+        Returns
+        -------
+        Z : torch.Tensor of shape (N, k)
+            射影後の表現。``cfg.renorm=True`` の場合は行方向に L2 正規化されます。
+
+        Raises
+        ------
+        RuntimeError
+            ``fit`` 前に呼び出された場合。
+        """
         self._check_fitted()
         X = self._check_X(X)
 
@@ -110,13 +237,44 @@ class ExtrinsicPCA:
 
     @torch.no_grad()
     def fit_transform(self, X: torch.Tensor) -> torch.Tensor:
+        """
+        ``fit`` と ``transform`` を続けて実行します。
+
+        Parameters
+        ----------
+        X : torch.Tensor of shape (N, D)
+            入力データ。
+
+        Returns
+        -------
+        Z : torch.Tensor of shape (N, k)
+            射影後の表現。
+        """
         return self.fit(X).transform(X)
 
     @torch.no_grad()
     def inverse_transform(self, Z: torch.Tensor) -> torch.Tensor:
         """
-        Approximate reconstruction in ambient space: Xhat = Z @ W^T (+ mean if centered).
-        (This is Euclidean reconstruction, not manifold geodesic reconstruction.)
+        低次元表現から元の周辺空間（R^D）へ近似再構成します。
+
+        ``Xhat = Z @ components_.T``（``center=True`` のときは ``+ mean_``）で計算します。
+
+        Parameters
+        ----------
+        Z : torch.Tensor of shape (N, k)
+            低次元表現。通常 ``transform`` の出力です。
+            注意：``cfg.renorm=True`` の場合、``Z`` は単位ノルム化されているため、
+            この再構成は **ユークリッド意味での近似** になり、元のスケール情報は失われます。
+
+        Returns
+        -------
+        Xhat : torch.Tensor of shape (N, D)
+            近似再構成（ユークリッド再構成）。多様体上の測地的再構成ではありません。
+
+        Raises
+        ------
+        RuntimeError
+            ``fit`` 前に呼び出された場合。
         """
         self._check_fitted()
         Z = Z.to(device=self.device, dtype=self.dtype)
@@ -126,6 +284,19 @@ class ExtrinsicPCA:
         return Xhat
 
     def save(self, path: str) -> None:
+        """
+        学習済み状態をファイルへ保存します（`torch.save`）。
+
+        Parameters
+        ----------
+        path : str
+            保存先パス。`torch.save` が書き込める場所を指定してください。
+
+        Notes
+        -----
+        - 保存されるのは ``cfg`` と、``mean_ / components_ / singular_values_ / explained_variance_`` です。
+        - Tensor は CPU に移して保存します。
+        """
         self._check_fitted()
         payload = {
             "cfg": asdict(self.cfg),
@@ -138,6 +309,25 @@ class ExtrinsicPCA:
 
     @classmethod
     def load(cls, path: str, device: Optional[str] = None) -> "ExtrinsicPCA":
+        """
+        保存済みファイルから復元します。
+
+        Parameters
+        ----------
+        path : str
+            読み込み元パス。
+        device : str or None, default=None
+            復元後に配置したいデバイス。指定した場合は ``cfg.device`` を上書きします。
+
+        Returns
+        -------
+        obj : ExtrinsicPCA
+            復元されたインスタンス（学習済み）。
+
+        Notes
+        -----
+        - 読み込みは一旦 CPU に map してから、指定デバイスへ移します。
+        """
         payload = torch.load(path, map_location="cpu")
         cfg = ExtrinsicPCAConfig(**payload["cfg"])
         if device is not None:
