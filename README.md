@@ -8,7 +8,7 @@ eval に関して標準空間＋逆変換後の精度も一応見ようか
 
 ### モデルの効果検証以下
 
-raw 256dim vs extrinsic_pca 16dim vs MAE 16dim
+raw 256dim vs extrinsic_pca 32dim vs MAE 32dim
 
 - 温度ごとのt予測
 - 樹種識別
@@ -20,7 +20,7 @@ raw 256dim vs extrinsic_pca 16dim vs MAE 16dim
 → 有用性の証明
 
 ### クラスタリング
-raw 256dim vs extrinsic_pca 16dim vs MAE 16dim <br>
+raw 256dim vs extrinsic_pca 32dim vs MAE 32dim <br>
 
 以下追加検証
 - シルエットスコア
