@@ -95,7 +95,11 @@ class ExtrinsicPCA:
     singular_values_ : torch.Tensor of shape (k,) or None
         上位 ``k`` 個の特異値。
     explained_variance_ : torch.Tensor of shape (k,) or None
-        サンプル分散としての説明分散。実装上は ``S^2 / max(1, N-1)`` を格納します。
+        ``center=True`` のときのみ、中心化済み共分散に対応する「説明分散」を格納します。
+        実装上は ``S^2 / max(1, N-1)`` です。
+    explained_moment_ : torch.Tensor of shape (k,) or None
+        ``center=False`` のときのみ、原点周り二次モーメント（second moment）に対応する統計を格納します。
+        実装上は ``S^2 / max(1, N)`` です（中心化していないため、一般的な“説明分散”とは別物）。
 
     Notes
     -----
@@ -134,7 +138,8 @@ class ExtrinsicPCA:
         self.mean_: Optional[torch.Tensor] = None          # (D,)
         self.components_: Optional[torch.Tensor] = None    # (D,k)
         self.singular_values_: Optional[torch.Tensor] = None  # (k,)
-        self.explained_variance_: Optional[torch.Tensor] = None  # (k,)
+        self.explained_variance_: Optional[torch.Tensor] = None  # (k,) center=True only
+        self.explained_moment_: Optional[torch.Tensor] = None    # (k,) center=False only
 
     @torch.no_grad()
     def fit(self, X: torch.Tensor) -> "ExtrinsicPCA":
@@ -163,7 +168,8 @@ class ExtrinsicPCA:
         -----
         - ``center=True`` の場合は平均との差分を取った ``Xc`` に対して分解します。
         - ``method="lowrank"`` の場合のみ ``seed`` が乱数性に影響します（再現性のため）。
-        - ``explained_variance_`` は実装上 ``S^2 / max(1, N-1)`` を格納します。
+        - ``center=True`` のときは ``explained_variance_ = S^2 / max(1, N-1)`` を格納します。
+        - ``center=False`` のときは ``explained_variance_=None`` とし、代わりに ``explained_moment_ = S^2 / max(1, N)`` を格納します。
         """
         X = self._check_X(X)
 
@@ -174,14 +180,24 @@ class ExtrinsicPCA:
             self.mean_ = None
             Xc = X
 
+        n, d = Xc.shape
+        min_nd = min(int(n), int(d))
+
         k = int(self.cfg.n_components)
-        if k <= 0 or k > Xc.shape[1]:
-            raise ValueError(f"n_components must be in [1, D]. got {k}, D={Xc.shape[1]}")
+        if k <= 0 or k > min_nd:
+            raise ValueError(
+                f"n_components must be in [1, min(N,D)]. got {k}, N={int(n)}, D={int(d)}"
+            )
 
         # compute principal directions in R^D
         if self.cfg.method == "lowrank":
             q = self.cfg.q if self.cfg.q is not None else (k + 8)
-            torch.manual_seed(int(self.cfg.seed))
+            q = int(q)
+            # torch.pca_lowrank requires q <= min(N, D). Also keep q >= k.
+            q = max(q, k)
+            q = min(q, min_nd)
+
+            self._set_seed(int(self.cfg.seed))
             # torch.pca_lowrank returns U, S, V where Xc ≈ U diag(S) V^T ; V is (D, q)
             U, S, V = torch.pca_lowrank(Xc, q=q, center=False, niter=int(self.cfg.niter))
             # principal components are first k columns of V
@@ -197,10 +213,17 @@ class ExtrinsicPCA:
         self.components_ = W  # (D,k)
         self.singular_values_ = Sk
 
-        # explained variance (sample) ~ S^2 / (N-1)
-        n = Xc.shape[0]
-        denom = max(1, n - 1)
-        self.explained_variance_ = (Sk ** 2) / denom
+        # --- output statistics ---
+        # Centered data => covariance eigenvalues: S^2 / (N-1)
+        # Uncentered data => second-moment eigenvalues: S^2 / N
+        if self.cfg.center:
+            denom = max(1, int(n) - 1)
+            self.explained_variance_ = (Sk ** 2) / denom
+            self.explained_moment_ = None
+        else:
+            denom = max(1, int(n))
+            self.explained_variance_ = None
+            self.explained_moment_ = (Sk ** 2) / denom
         return self
 
     @torch.no_grad()
@@ -294,7 +317,7 @@ class ExtrinsicPCA:
 
         Notes
         -----
-        - 保存されるのは ``cfg`` と、``mean_ / components_ / singular_values_ / explained_variance_`` です。
+        - 保存されるのは ``cfg`` と、``mean_ / components_ / singular_values_ / explained_variance_ / explained_moment_`` です。
         - Tensor は CPU に移して保存します。
         """
         self._check_fitted()
@@ -304,6 +327,7 @@ class ExtrinsicPCA:
             "components": self.components_.detach().cpu(), # type: ignore
             "singular_values": None if self.singular_values_ is None else self.singular_values_.detach().cpu(),
             "explained_variance": None if self.explained_variance_ is None else self.explained_variance_.detach().cpu(),
+            "explained_moment": None if self.explained_moment_ is None else self.explained_moment_.detach().cpu(),
         }
         torch.save(payload, path)
 
@@ -338,11 +362,20 @@ class ExtrinsicPCA:
         obj.components_ = payload["components"].to(obj.device, obj.dtype)
         obj.singular_values_ = None if payload["singular_values"] is None else payload["singular_values"].to(obj.device, obj.dtype)
         obj.explained_variance_ = None if payload["explained_variance"] is None else payload["explained_variance"].to(obj.device, obj.dtype)
+        em = payload.get("explained_moment", None)
+        obj.explained_moment_ = None if em is None else em.to(obj.device, obj.dtype)
         return obj
 
     # -----------------
     # internal helpers
     # -----------------
+    def _set_seed(self, seed: int) -> None:
+        # CPU RNG
+        torch.manual_seed(int(seed))
+        # CUDA RNG (if available). This helps reproducibility of randomized algorithms.
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(seed))
+
     def _check_X(self, X: torch.Tensor) -> torch.Tensor:
         if not isinstance(X, torch.Tensor):
             raise TypeError("X must be a torch.Tensor")
